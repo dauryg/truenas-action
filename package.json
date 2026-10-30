@@ -1,6 +1,6 @@
 {
   "name": "truenas",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Github action to interact with truenas through its JSON-RPC 2.0 websocket api",
   "main": "index.js",
   "type": "module",

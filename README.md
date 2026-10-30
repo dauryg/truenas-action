@@ -59,6 +59,8 @@ Long-running methods (`app.create`, `app.update`, `filesystem.chown`, uploads an
     parameters: '[${{ steps.update_app.outputs.result }}]'
 ```
 
+The parameter is the job id, or the reply of TrueNAS's HTTP `/_upload` endpoint (`{"job_id": 123}`) passed through unchanged, so a `curl` upload's output can go straight into `parameters: '[${{ steps.upload.outputs.job_id }}]'`.
+
 The action handles `core.job_wait` itself and doesn't send it to TrueNAS: `core.job_wait` is a job too, so over the API it would only return another job id. Instead the action logs in once and polls `core.get_jobs` every 2 seconds until the job finishes:
 
 - `SUCCESS`: the step passes, and `result` is the job's result.

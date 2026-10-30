@@ -38,9 +38,12 @@ export async function run(): Promise<void> {
     if (apiMethod === 'core.job_wait') {
       // core.job_wait is itself a job: sent over JSON-RPC it returns a new job id and
       // waits for nothing. So the action waits here instead, polling the job.
-      const jobId = Array.isArray(params) ? params[0] : undefined;
+      // The id is either a bare number (what JSON-RPC job methods return) or the
+      // HTTP /_upload endpoint's reply, {"job_id": N}, passed through as is.
+      const arg = Array.isArray(params) ? params[0] : undefined;
+      const jobId = typeof arg === 'object' && arg !== null ? arg.job_id : arg;
       if (!Number.isInteger(jobId)) {
-        throw new Error(`core.job_wait needs a job id as its only parameter, got ${JSON.stringify(params)}`);
+        throw new Error(`core.job_wait needs a job id or {"job_id": N} as its only parameter, got ${JSON.stringify(params)}`);
       }
       const jobTimeoutSeconds = Number(jobTimeoutInput);
       if (!Number.isFinite(jobTimeoutSeconds) || jobTimeoutSeconds <= 0) {
