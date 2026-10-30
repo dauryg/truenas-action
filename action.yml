@@ -15,6 +15,10 @@ inputs:
   parameters:
     description: 'JSON array of method arguments. Format: [parameter 1, parameter 2]. Examples: [[], {"limit": 2}] (options only), [[["name","~",".*media.*"]], {"limit": 3, "select": ["name", "pool"]}] (with filter)'
     required: false
+  job-timeout:
+    description: 'Seconds to wait for the job when api-method is core.job_wait. The step fails if the job is still running after this (the job itself keeps running).'
+    required: false
+    default: '600'
 outputs:
   result:
     description: 'JSON response from the TrueNAS API call'

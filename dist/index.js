@@ -28017,6 +28017,8 @@ function info(message) {
 var TrueNASClient = class {
   wsURL;
   apiKey;
+  socket;
+  nextId = 0;
   constructor(wsURL, apiKey) {
     const url = new URL(wsURL);
     if (url.protocol !== "wss:" && url.protocol !== "ws:")
@@ -28030,14 +28032,45 @@ var TrueNASClient = class {
     try {
       const authRequest = this.request(id++, "auth.login_with_api_key", [this.apiKey]);
       const apiRequest = this.request(id++, method, params);
-      const authResponse = await this.call(socket, authRequest, timeoutMs);
+      const authResponse = await this.exchange(socket, authRequest, timeoutMs);
       if (authResponse.result !== true) {
         throw new Error("Authentication failed");
       }
-      return await this.call(socket, apiRequest, timeoutMs);
+      return await this.exchange(socket, apiRequest, timeoutMs);
     } finally {
       socket.close();
     }
+  }
+  // Opens one connection and logs in; call() then reuses it until close().
+  async connect(timeoutMs = 3e4) {
+    if (this.socket) {
+      throw new Error("Already connected. Call close() first");
+    }
+    const socket = new WebSocket(this.wsURL);
+    this.socket = socket;
+    try {
+      const authRequest = this.request(this.nextId++, "auth.login_with_api_key", [this.apiKey]);
+      const authResponse = await this.exchange(socket, authRequest, timeoutMs);
+      if (authResponse.result !== true) {
+        throw new Error("Authentication failed");
+      }
+    } catch (error) {
+      this.close();
+      throw error;
+    }
+  }
+  async call(method, params, timeoutMs = 3e4) {
+    if (!this.socket) {
+      throw new Error("Not connected. Call connect() first");
+    }
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error(`Connection lost (WebSocket readyState ${this.socket.readyState})`);
+    }
+    return await this.exchange(this.socket, this.request(this.nextId++, method, params), timeoutMs);
+  }
+  close() {
+    this.socket?.close();
+    this.socket = void 0;
   }
   request(id, method, params) {
     return {
@@ -28053,7 +28086,7 @@ var TrueNASClient = class {
     if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
     return String(data);
   }
-  call(socket, req, timeoutMs) {
+  exchange(socket, req, timeoutMs) {
     return new Promise((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timer);
@@ -28102,6 +28135,7 @@ var TrueNASClient = class {
   }
 };
 
+const JOB_POLL_MS = 2000;
 async function run() {
     try {
         // Get inputs from GitHub Actions
@@ -28109,6 +28143,7 @@ async function run() {
         const apiKey = getInput('api-key', { required: true });
         const apiMethod = getInput('api-method', { required: true });
         const parametersInput = getInput('parameters');
+        const jobTimeoutInput = getInput('job-timeout') || '600';
         // Log inputs for debugging (mask API key)
         info(`Connecting to TrueNAS at: ${host}`);
         info(`Executing method: ${apiMethod}`);
@@ -28130,19 +28165,35 @@ async function run() {
         }
         // Create TrueNAS client instance
         const client = new TrueNASClient(host, apiKey);
-        // Send the API request
-        info(`Sending API request...`);
-        const response = await client.sendRequest(apiMethod, params);
-        // Check for errors in the response
-        if (response.error) {
-            error(`TrueNAS API Error ${response.error.code}: ${response.error.message}`);
-            if (response.error.data) {
-                error(`Error data: ${JSON.stringify(response.error.data)}`);
+        let result;
+        if (apiMethod === 'core.job_wait') {
+            // core.job_wait is itself a job: sent over JSON-RPC it returns a new job id and
+            // waits for nothing. So the action waits here instead, polling the job.
+            const jobId = Array.isArray(params) ? params[0] : undefined;
+            if (!Number.isInteger(jobId)) {
+                throw new Error(`core.job_wait needs a job id as its only parameter, got ${JSON.stringify(params)}`);
             }
-            throw new Error(`TrueNAS API returned error: ${response.error.message}`);
+            const jobTimeoutSeconds = Number(jobTimeoutInput);
+            if (!Number.isFinite(jobTimeoutSeconds) || jobTimeoutSeconds <= 0) {
+                throw new Error(`job-timeout must be a positive number of seconds, got "${jobTimeoutInput}"`);
+            }
+            result = await waitForJob(client, jobId, jobTimeoutSeconds * 1000);
+        }
+        else {
+            // Send the API request
+            info(`Sending API request...`);
+            const response = await client.sendRequest(apiMethod, params);
+            // Check for errors in the response
+            if (response.error) {
+                error(`TrueNAS API Error ${response.error.code}: ${response.error.message}`);
+                if (response.error.data) {
+                    error(`Error data: ${JSON.stringify(response.error.data)}`);
+                }
+                throw new Error(`TrueNAS API returned error: ${response.error.message}`);
+            }
+            result = response.result;
         }
         // Success - set output and log result
-        const result = response.result;
         const resultJson = JSON.stringify(result);
         const preview = resultJson.length > 200
             ? `${resultJson.substring(0, 200)}...`
@@ -28153,6 +28204,45 @@ async function run() {
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setFailed(message);
+    }
+}
+// Polls the job over one login (TrueNAS rate-limits logins) until it finishes,
+// and returns its result. Throws if the job fails, is aborted or outlives timeoutMs.
+async function waitForJob(client, jobId, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = '';
+    info(`Waiting up to ${timeoutMs / 1000}s for job ${jobId}...`);
+    await client.connect();
+    try {
+        while (true) {
+            // get: true fails with MatchNotFound when no such job is visible to this key
+            const response = await client.call('core.get_jobs', [[['id', '=', jobId]], { get: true }]);
+            if (response.error) {
+                throw new Error(`core.get_jobs failed for job ${jobId}: ${response.error.message}`);
+            }
+            const job = response.result;
+            const status = `${job.state}${job.progress?.description ? `: ${job.progress.description}` : ''}`;
+            if (status !== lastStatus) {
+                info(`Job ${jobId} (${job.method}) ${status}`);
+                lastStatus = status;
+            }
+            if (job.state === 'SUCCESS') {
+                return job.result;
+            }
+            if (job.state === 'FAILED' || job.state === 'ABORTED') {
+                if (job.logs_excerpt) {
+                    error(`Job ${jobId} logs:\n${job.logs_excerpt}`);
+                }
+                throw new Error(`Job ${jobId} (${job.method}) ${job.state}: ${job.error ?? 'no error message'}`);
+            }
+            if (Date.now() > deadline) {
+                throw new Error(`Job ${jobId} (${job.method}) still ${job.state} after ${timeoutMs / 1000}s; it keeps running on TrueNAS`);
+            }
+            await new Promise(resolve => setTimeout(resolve, JOB_POLL_MS));
+        }
+    }
+    finally {
+        client.close();
     }
 }
 
